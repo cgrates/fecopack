@@ -1,2 +1,2 @@
 # fecopack
-FeCoPack RPM Collector fetches packages build by Copr by listening on Fedora AMQP channel
+FeCoPack RPM Collector will fetch packages built by Copr, being informed about them by listening on Fedora AMQP channel
