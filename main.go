@@ -33,16 +33,14 @@ const (
 	Cert   = "/etc/fedora-messaging/fedora-cert.pem"
 	Key    = "/etc/fedora-messaging/fedora-key.pem"
 
-	DownloadUrl    = "https://download.copr.fedorainfracloud.org/results/"
-	CGRPrefix      = "cgrates-"
-	CGRSuffix      = "-cgrates"
-	RpmSuffix      = "rpm"
-	ArchBuild      = "x86_64"
-	Current        = "cgrates-current"
-	PackageDir     = "/var/packages/rpm"
-	PkgOwner       = "owner"
-	BranchMaster   = "master"
-	ProjectNightly = "nightly"
+	DownloadUrl = "https://download.copr.fedorainfracloud.org/results/"
+	CGRPrefix   = "cgrates-"
+	CGRSuffix   = "-cgrates"
+	RpmSuffix   = "rpm"
+	ArchBuild   = "x86_64"
+	Current     = "cgrates-current"
+	PackageDir  = "/var/packages/rpm"
+	PkgOwner    = "owner"
 )
 
 type CoprBuild struct {
@@ -188,10 +186,7 @@ func downloadFile(fileName, projectName, chroot, url string) (filePath string, e
 	}
 	log.Printf("Making a Request on %v\n", url)
 	defer resp.Body.Close()
-	if projectName == BranchMaster {
-		projectName = ProjectNightly
 
-	}
 	dirPath := filepath.Join(PackageDir, projectName, chroot)
 	if _, err = os.Stat(dirPath); os.IsNotExist(err) {
 		if err = os.MkdirAll(dirPath, 0775); err != nil {
