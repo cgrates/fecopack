@@ -91,23 +91,34 @@ func setupConn(tls *tls.Config) (*amqp.Connection, *amqp.Channel, error) {
 	return conn, ch, err
 }
 
-func consumeMessage(ctx context.Context, ch *amqp.Channel, queueName string) {
-	errChan := make(chan error)
-	fileChan := make(chan string)
+func queueBind(ch *amqp.Channel) (string, error) {
+	queue, err := ch.QueueDeclare(
+		newUuid(),
+		false,
+		true,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
 
-	go func() {
-		for {
-			select {
-			case err := <-errChan:
-				log.Println("Error:", err)
-			case file := <-fileChan:
-				log.Println("File created:", file)
-			case <-ctx.Done():
-				log.Println("Stopping error and file logging due to context cancellation")
-				return
-			}
-		}
-	}()
+		return "", err
+	}
+	if err = ch.QueueBind(
+		queue.Name,
+		RoutingKey,
+		Exchange,
+		false,
+		nil,
+	); err != nil {
+		return "", err
+	}
+	return queue.Name, nil
+}
+
+func consumeMessage(ctx context.Context, ch *amqp.Channel, queueName string) {
+	errChan := make(chan error, 1)
+	fileChan := make(chan string, 1)
 
 	msgs, err := ch.Consume(
 		queueName,
@@ -123,51 +134,56 @@ func consumeMessage(ctx context.Context, ch *amqp.Channel, queueName string) {
 		return
 	}
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
-	c := &CoprBuild{}
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Stopping message consumption due to context cancellation")
 			return
+		case err := <-errChan:
+			log.Println("Error:", err)
+		case file := <-fileChan:
+			log.Println("File created:", file)
+		case <-ctx.Done():
 		case msg, ok := <-msgs:
 			if !ok {
 				return
 			}
-			processMessage(errChan, fileChan, msg, json, c)
+			processMessage(errChan, fileChan, msg, json)
 		}
 	}
 }
 
-func processMessage(errc chan<- error, filech chan<- string, msg amqp.Delivery, json jsoniter.API, c *CoprBuild) {
+func processMessage(errCh chan<- error, filech chan string, msg amqp.Delivery, json jsoniter.API) {
 	defer msg.Ack(false)
-	var owner string
+	var coprBuild CoprBuild
 	iter := jsoniter.ParseBytes(json, msg.Body)
 
 	for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
 		if field == PkgOwner {
-			owner = iter.ReadString()
+			if owner := iter.ReadString(); owner != Owner {
+				return
+			}
 			break
 		}
 		iter.Skip()
 	}
-	if owner != Owner {
-		return
-	}
-	if err := json.Unmarshal(msg.Body, c); err != nil {
+
+	if err := json.Unmarshal(msg.Body, &coprBuild); err != nil {
+		errCh <- err
 		return
 	}
 
-	if c.Version != "" {
-		go generateFiles(errc, filech, c.Owner, c.Chroot, c.Copr, c.Version, c.Build)
+	if coprBuild.Version != "" {
+		go generateFiles(errCh, filech, coprBuild)
 	}
 }
-func generateFiles(errc chan<- error, filech chan<- string, owner, chroot, project string, version string, build int) {
-	urlPath, err := url.JoinPath(DownloadUrl, owner, project, chroot, fmt.Sprintf("0%v", build)+CGRSuffix, CGRPrefix+strings.Join([]string{version, ArchBuild, RpmSuffix}, "."))
+func generateFiles(errc chan<- error, filech chan<- string, c CoprBuild) {
+	urlPath, err := url.JoinPath(DownloadUrl, c.Owner, c.Copr, c.Chroot, fmt.Sprintf("0%v", c.Build)+CGRSuffix, CGRPrefix+strings.Join([]string{c.Version, ArchBuild, RpmSuffix}, "."))
 	if err != nil {
 		errc <- err
 		return
 	}
-	file, err := downloadFile(strings.Join([]string{version, ArchBuild, RpmSuffix}, "."), project, chroot, urlPath)
+	file, err := downloadFile(strings.Join([]string{c.Version, ArchBuild, RpmSuffix}, "."), c.Copr, c.Chroot, urlPath)
 	if err != nil {
 		errc <- err
 		return
@@ -216,54 +232,39 @@ func downloadFile(fileName, projectName, chroot, url string) (filePath string, e
 func main() {
 	logName := flag.String("log_name", "", "Logger file name ")
 	flag.Parse()
-	logwriter, err := syslog.New(syslog.LOG_NOTICE, fmt.Sprintf("<%s>", *logName))
+
+	logwriter, err := syslog.New(syslog.LOG_NOTICE, *logName)
 	if err != nil {
 		log.Fatal("Failed to initialize syslog writer: ", err)
 	}
 	log.SetOutput(logwriter)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	tlsConfig, err := setupTLS()
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	conn, ch, err := setupConn(tlsConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	defer conn.Close()
 	defer ch.Close()
 
-	queue, err := ch.QueueDeclare(
-		newUuid(),
-		false,
-		true,
-		false,
-		false,
-		nil,
-	)
+	queueName, err := queueBind(ch)
 	if err != nil {
-		log.Println("Error declaring queue:", err)
-		return
-	}
-	err = ch.QueueBind(
-		queue.Name,
-		RoutingKey,
-		Exchange,
-		false,
-		nil,
-	)
-	if err != nil {
-		log.Println("Error binding queue:", err)
-		return
+		log.Fatal(err)
 	}
 
-	go consumeMessage(ctx, ch, queue.Name)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go consumeMessage(ctx, ch, queueName)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
+	log.Println("FecoPack started running...")
 	<-sigs
 	cancel()
 	log.Println("Connections closed. Exiting...")
