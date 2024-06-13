@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -26,8 +27,9 @@ const (
 	FedoraBroker = "amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub"
 	Exchange     = "amq.topic"
 	RoutingKey   = "org.fedoraproject.prod.copr.build.end"
-	Owner        = "cgrates"
 
+	Owner        = "cgrates"
+	MasterBranch = "master"
 	//cacert and key paths
 	CaCert = "/etc/fedora-messaging/cacert.pem"
 	Cert   = "/etc/fedora-messaging/fedora-cert.pem"
@@ -133,7 +135,6 @@ func consumeMessage(ctx context.Context, ch *amqp.Channel, queueName string) {
 		log.Println("Error consuming messages:", err)
 		return
 	}
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	for {
 		select {
 		case <-ctx.Done():
@@ -148,15 +149,15 @@ func consumeMessage(ctx context.Context, ch *amqp.Channel, queueName string) {
 			if !ok {
 				return
 			}
-			processMessage(errChan, fileChan, msg, json)
+			go processMessage(errChan, fileChan, msg)
+			msg.Ack(true)
 		}
 	}
 }
 
-func processMessage(errCh chan<- error, filech chan string, msg amqp.Delivery, json jsoniter.API) {
-	defer msg.Ack(false)
+func processMessage(errCh chan<- error, filech chan<- string, msg amqp.Delivery) {
 	var coprBuild CoprBuild
-	iter := jsoniter.ParseBytes(json, msg.Body)
+	iter := jsoniter.ParseBytes(jsoniter.ConfigCompatibleWithStandardLibrary, msg.Body)
 
 	for field := iter.ReadObject(); field != ""; field = iter.ReadObject() {
 		if field == PkgOwner {
@@ -174,21 +175,25 @@ func processMessage(errCh chan<- error, filech chan string, msg amqp.Delivery, j
 	}
 
 	if coprBuild.Version != "" {
-		go generateFiles(errCh, filech, coprBuild)
+		file, err := generateFiles(coprBuild)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		filech <- file
 	}
+
 }
-func generateFiles(errc chan<- error, filech chan<- string, c CoprBuild) {
+func generateFiles(c CoprBuild) (file string, err error) {
 	urlPath, err := url.JoinPath(DownloadUrl, c.Owner, c.Copr, c.Chroot, fmt.Sprintf("0%v", c.Build)+CGRSuffix, CGRPrefix+strings.Join([]string{c.Version, ArchBuild, RpmSuffix}, "."))
 	if err != nil {
-		errc <- err
 		return
 	}
-	file, err := downloadFile(strings.Join([]string{c.Version, ArchBuild, RpmSuffix}, "."), c.Copr, c.Chroot, urlPath)
+	file, err = downloadFile(strings.Join([]string{c.Version, ArchBuild, RpmSuffix}, "."), c.Copr, c.Chroot, urlPath)
 	if err != nil {
-		errc <- err
 		return
 	}
-	filech <- file
+	return
 }
 
 func downloadFile(fileName, projectName, chroot, url string) (filePath string, err error) {
@@ -202,7 +207,9 @@ func downloadFile(fileName, projectName, chroot, url string) (filePath string, e
 	}
 	log.Printf("Making a Request on %v\n", url)
 	defer resp.Body.Close()
-
+	if projectName == MasterBranch {
+		projectName = "nightly"
+	}
 	dirPath := filepath.Join(PackageDir, projectName, chroot)
 	if _, err = os.Stat(dirPath); os.IsNotExist(err) {
 		if err = os.MkdirAll(dirPath, 0775); err != nil {
@@ -219,6 +226,7 @@ func downloadFile(fileName, projectName, chroot, url string) (filePath string, e
 	if file, err = os.Create(filePath); err != nil {
 		return
 	}
+	defer file.Close()
 	if _, err = io.Copy(file, resp.Body); err != nil {
 		return
 	}
