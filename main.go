@@ -30,6 +30,7 @@ const (
 
 	Owner        = "cgrates"
 	MasterBranch = "master"
+	V010Branch   = "v0.10"
 	//cacert and key paths
 	CaCert = "/etc/fedora-messaging/cacert.pem"
 	Cert   = "/etc/fedora-messaging/fedora-cert.pem"
@@ -220,6 +221,23 @@ func downloadFile(fileName, projectName, chroot, url string) (filePath string, e
 	curr := filepath.Join(dirPath, strings.Join([]string{Current, RpmSuffix}, "."))
 	if err = os.Remove(curr); err != nil && !os.IsNotExist(err) {
 		return
+	}
+
+	// ❗ Remove previous dev builds ONLY for v0.10 branch
+	if projectName == V010Branch && strings.Contains(fileName, "+") {
+		files, err := os.ReadDir(dirPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read dir: %w", err)
+		}
+		for _, f := range files {
+			name := f.Name()
+			if strings.Contains(name, "+") &&
+				strings.HasSuffix(name, ".rpm") &&
+				strings.HasPrefix(name, CGRPrefix) {
+				log.Printf("Removing old dev build: %s", name)
+				_ = os.Remove(filepath.Join(dirPath, name))
+			}
+		}
 	}
 
 	filePath = filepath.Join(dirPath, CGRPrefix+fileName)
